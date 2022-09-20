@@ -1,0 +1,201 @@
+#!/bin/sh
+
+# Scripts for sequence quality check, processing, de novo assembly and Differentail expression analysis
+
+#FASTQC report on raw data
+for file in *.fastq.gz; do fastqc -o <output_directory> $file; done 
+
+#trimmimg adaptes and trimming low quality bases 
+for R1 in *_1.fastq.gz; do R2=${R1/_1.fastq.gz}"_2.fastq.gz"; r1paired=${R1/fastq.gz}"paired.fastq"; r2paired=${R2/fastq.gz}"paired.fastq"; r1unpaired=${R1/fastq.gz}"unpaired.fastq"; r2unpaired=${R2/fastq.gz}"unpaired.fastq";html=${R1/_1.fastq.gz}"fastp.html"; json=${R1/_1.fastq.gz}"fastp.json"; fastp -i $R1 -I $R2 -o /fastp_output/$r1paired -O /fastp_output/$r2paired --unpaired1 /fastp_output/$r1unpaired --unpaired2 /fastp_output/$r2unpaired --adapter_fasta combined_adapters.fa -r cut_right_window_size 4 cut_right_mean_quality 30 -l 40 -h /fastp_output/$html -j /fastp_output/$json; done
+
+#FASTQC report on trimmed files
+for file in *.fastq.gz; do fastqc -o <output_directory> $file; done
+
+#Removing potential contaminat sequences
+ 
+./kraken2-build --download-taxonomy --db ../kraken2_database #Download the ncbi taxonomy names and tree and accession number to taxon maps
+
+./kraken2-build --download-library bacteria --db ../kraken2_database #Install reference library for bacteria
+./kraken2-build --download-library fungi --db ../kraken2_database #Install reference library for fungi
+./kraken2-build --download-library virus --db ../kraken2_database #Install reference library for virus
+
+./kraken2-build --threads 24 --build --db ../kraken2_database/ #Build the database
+
+#Classify reads 
+for R1 in *_1.paired.fastq.gz; do R2=${R1/1.paired.fastq.gz}"2.paired.fastq.gz";output=${R1/1.paired.fastq.gz}"output.txt";report=${R1/1.paired.fastq.gz}"report.txt";classified=${R1/1.paired.fastq.gz}"classified";unclassified=${R1/1.paired.fastq.gz}"unclassified"; ~/kraken2 --db ~/kraken2_database/ --threads 24 --gzip-compressed --confidence 0.3 --output ~/kraken_output/$output --report ~/kraken_output/$report --paired --use-names --report-zero-counts --classified-out ~/kraken_output/$classified#.fq --unclassified-out ~/kraken_output/$unclassified#.fq $R1 $R2; bgzip /kraken_output/*_unclassified_1.fq; bgzip /kraken_output/*_unclassified_2.fq; bgzip /kraken_output/*_classified_1.fq; bgzip /kraken_output/*_classified_2.fq; done
+
+#FASTQC report on filtreed files (after removing contaminant sequences)
+for file in *.fastq.gz; do fastqc -o <output_directory> $file; done
+
+
+#### De novo assembly
+#run filter_illumina to filter out low quality and short reads.
+#Also, for reads with ambigious bases (N), extract longest subsequence without N. 
+sudo `docker_drap_cmd` filter_illumina -i <read1_inputfile.fq.gz> -i <read2_inputfile.fq.gz> -o filter_illumina_output/<read1_outputfile.fq> -o filter_illumina_output/<read2_outputfile.fq> -q 30 -e -m 40 
+
+#Remove rRNA reads from the dataset
+#Step 1: From SILVA database download the 2 files: SILVA_132_LSUParc.full_metadata.gz (https://www.arb-silva.de/no_cache/download/archive/release_132/Exports/full_metadata/) and SILVA_138_SSUParc_tax_silva.fasta.gz (https://www.arb-silva.de/no_cache/download/archive/release_138/Exports/) (downloaded on 7 July,2020).
+#Step 2: Concatenate the two fasta files to get one combined fasta file
+#Step 3: Replace all U with T (Uracil with thymine) 
+sed s/U/T/g SILVA_LSUParc_SSUParc_combined.fasta.gz > SILVA_LSUParc_SSUParc_combined_modified.fasta.gz
+    
+#Step 4: map the output reads from filter_illumina to this combined fasta using bowtie2 
+for f1 in *_1_filtered.fq.gz; do f2=${f1/1_filtered.fq.gz}"2_filtered.fq.gz"; met=${f1/unclassified_1_filtered.fq.gz}"alignment_metrics.txt"; paln=${f1/unclassified_1_filtered.fq.gz}"paired_aligned.fq.gz"; punaln=${f1/unclassified_1_filtered.fq.gz}"paired_unaligned.fq.gz"; upaln=${f1/unclassified_1_filtered.fq.gz}"unpaired_aligned.fq.gz"; upunaln=${f1/unclassified_1_filtered.fq.gz}"unpaired_unaligned.fq.gz"; bowtie2 -q --phred33 --very-sensitive-local --local -x ~/volcano_island/remove_rRNA/Gobi -1 $f1 -2 $f2 -p 32 --met-file /remove_rRNA/bowtie_results/$met --al-conc-gz /remove_rRNA/bowtie_results/$paln --un-conc-gz /remove_rRNA/bowtie_results/$punaln  --al-gz /remove_rRNA/bowtie_results/$unaln --un-gz /remove_rRNA/bowtie_results/$ununaln | samtools view -b > output.bam ; done 
+
+#Build de novo assembly using Trinity within DRAP
+##runDRAP - this gives error at the rmbt-editing step
+
+sudo `docker_drap_cmd` runDrap -o /runDRAP_pooled_asembly_merge_fastq -1 <read1 inputfiles separated by comma> -2 <read2 inputfiles separated by comma> -c '-x' -d trinity --no-trim --norm-src trinity -m bwa --no-rate --dbg-mem 128 --norm-mem 128 -q 1 
+sudo `docker_drap_cmd` runDrap -o ./DRAP_pooled_assembly -1 merge_R1.norm.fq.gz -2 merge_R2.norm.fq.gz -c '-x' -d trinity --no-trim --no-norm -m bwa --no-rate --dbg-mem 128 --norm-mem 128 --write
+
+sudo `docker_drap_cmd` runDrap -o ./DRAP_pooled_assembly -1 merge_R1.norm.fq.gz -2 merge_R2.norm.fq.gz -c '-x' -d trinity --no-trim --no-norm -m bwa --no-rate --dbg-mem 128 --norm-mem 128 --run
+
+###De novo Assembly Quality Assessment 
+
+#Transdecoder 
+
+TransDecoder.LongOrfs -t <fasta_file.fa>
+
+wget ftp://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_sprot.fasta.gz # Download swissprot database
+gunzip uniprot_sprot.fasta.gz
+
+makeblastdb -dbtype prot -in uniprot_sprot.fasta -title swissprot -parse_seqids -out swissprot -logfile swissprot_DB.log 
+
+blastp -query ....transdecoder_dir/longest_orfs.pep -db /swissprot -evalue 1e-5 -outfmt 6 -max_target_seqs 1 -num_threads 30 > blastp_output_swissprot.outfmt6
+
+TransDecoder.Predict -t <fasta_file.fa> --retain_blastp_hits <blastp_output_swissprot.outfmt6> --single_best_only 
+
+#Get complete transcript seq for final selected contigs 
+awk 'BEGIN{FS="\t"}{if ($3 == "gene") print}' *.transdecoder.gff3 > ../final_assembly_after_transdecoder/*.transdecoder_genes.gff3  
+
+cut -f 1,4,5 *.transdecoder_genes.gff3 > *.transdecoder_genes.bed
+
+#bedtools v2.26.0
+bedtools getfasta -fi <raw_fasta (DRAP output)> -bed *.transdecoder_genes.bed > <final_ref.fa> 
+
+#DRAP runAssessment(for quality check)
+sudo `docker_drap_cmd` runAssessment -a <final_ref.fa> > --R1 merge_R1.norm.fq.gz --R2 merge_R2.norm.fq.gz -o ./DRAP_runAssessment --no-busco
+
+##Mapping RNA-Seq reads to de novo assembled transcriptome 
+
+#Step 1: Create index for ref
+bowtie2-build --threads 30 -f <fastafile> meta_asm_meta_contigs
+
+#Step 2: mapping
+for R1 in *unaligned.1.fq.gz;do R2=${R1/_unaligned.1.fq.gz}"_unaligned.2.fq.gz"; sam=${R1/_paired_unaligned.1.fq.gz}".bam"; bowtie2 -q -p 30 -a --sensitive --no-discordant --no-mixed -x <name of ref index> -1 $R1 -2 $R2 | samtools view -b > ~/$sam; done
+
+#Corset v1.09 (to furhter cluster transcripts)
+
+corset -m 0 -p pooled_asm_second_pass -g ctrl,ctrl,ctrl,ctrl,ctrl,ctrl,ctrl,ctrl,lph,lph,lph,lph,lph,lph,lph,lph GB1-CTRL.bam GB3-CTRL.bam GB4-CTRL.bam GB5-CTRL.bam GB6-CTRL.bam GB7-CTRL.bam GB8-CTRL.bam GB9-CTRL.bam GB1-LPH.bam GB3-LPH.bam GB4-LPH.bam GB5-LPH.bam GB6-LPH.bam GB9-LPH.bam GB10-LPH.bam GB11-LPH.bam
+
+#get fasta seq for corset clusters 
+## Corset-tools Companion scripts for working with transcript clusters generated by Corset [https://github.com/Adamtaranto/Corset-tools]. 
+python ~/Corset-tools-master/fetchClusterSeqs.py -i <fasta> -c <textfile> -o <output.fasta> -l
+
+#Mapping reads to the final de novo assembly using bowtie2 v2.4.1
+
+bowtie2-build --threads 30 -f G_incognitus_final_asm.fasta G_incognitus
+for R1 in *unaligned.1.fq.gz;do R2=${R1/_unaligned.1.fq.gz}"_unaligned.2.fq.gz"; sam=${R1/_paired_unaligned.1.fq.gz}".bam"; bowtie2 -q -p 30 --no-discordant --no-mixed --sensitive --dpad 0 --gbar 99999999 --mp 1,1 --np 1 --score-min L,0,-0.1 -x /media/Sneha/Sneha/Vulcano_island/mapping_to_final_asm/G_incognitus -1 $R1 -2 $R2 | samtools view -b > /media/Sneha/Sneha/Vulcano_island/mapping_to_final_asm/$sam; done
+
+# Quantification using RSEM
+rsem-prepare-reference -p 30 <reference.fa> <reference_name>
+
+rsem-sam-validator <bam_file> # check if bam file is compatible for rsem
+
+convert-sam-for-rsem -p 20 <bam_file> <output_bam> 
+
+for file in *_rsem.bam; do sample=${file/_rsem.bam}""; rsem-calculate-expression --paired-end -p 20 --alignments --no-bam-output $file <ref_name> $sample; done
+
+for file in ~/*.bam; do sample=${file/.bam}""; rsem-calculate-expression --paired-end -p 20 --alignments --no-bam-output $file ../G_incognitus $sample; done
+
+#Calculating various assembly stats 
+
+#1. N50
+TrinityStats.pl  meta_asm_meta_contigs_corset.fasta > meta_asm_N50.txt
+
+TrinityStats.pl  G_incognitus_final_asm.fasta > pooled_asm_N50.txt
+
+#2. ExN50
+contig_ExN50_statistic.pl RSEM.isoform.TMM.EXPR.matrix G_incognitus_final_asm.fasta > pooled_asm_ExN50.txt
+
+#3. rnaQUAST v2.1.0)
+python ../softwares/rnaquast/rnaQUAST.py -c G_incognitus_final_asm.fasta -o rnaquast_output/G_incognitus -t 20
+
+#4. L50 (stats.sh script from BBMap - version 38.87)
+stats.sh in='/media/Sneha/Sneha/Vulcano_island/corset/pooled_asm_second_pass/G_incognitus_final_asm.fasta' > bbmap_output.txt
+
+###Differentail expression analysis
+#!/bin/RScript
+
+library(DESeq2)
+library(pheatmap)
+library(dplyr)
+library(RColorBrewer)
+library(ggplot2)
+library(ggrepel)
+library(ggfortify)
+library(pcaExplorer)
+
+counts <- read.table("counts.txt",header=T)
+metadata <- read.csv("coldata.csv",row.names=1)
+
+# check if all colnames of count matrix are in the rownames of sample info
+(all(rownames(metadata) %in% colnames(counts)) || all(colnames(counts) %in% rownames(metadata))) 
+
+# check if columns of count matrix are in same order as rows of sample info
+(all(colnames(counts) == rownames(metadata)))
+
+dds <- DESeqDataSetFromMatrix(countData = counts, colData = metadata, design = ~ condition)
+
+# Remove transcripts which have zero reads in all samples
+keep <- rowSums(counts(dds)) > 0
+dds <- dds[keep,]
+
+# Explicitly set the factor levels
+dds$condition <- relevel(dds$condition, ref = "CTRL")
+
+# DE analysis - LPH vs CTRL
+dds <- DESeq(dds)
+res <- results(dds, alpha = 0.05)
+summary(res)
+res
+results <- data.frame(res)
+results <- na.omit(results)
+sig_results <- subset(results,results$padj<0.05 & abs(results$log2FoldChange)>0.3 & results$baseMean>10)
+
+write.csv(results,file="DE_results_all.csv")
+write.csv(sig_results,file="DE_results_significant.csv")
+
+#************************ Useful plots
+# MA plot
+
+png("MA_plot.png",width=600, height=600)
+plotMA(res,alpha=0.05)
+dev.off()
+
+# Dispersion plot
+png("Dispersion_plot.png")
+plotDispEsts(dds)
+dev.off()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
